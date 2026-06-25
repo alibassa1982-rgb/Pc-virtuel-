@@ -1,0 +1,59 @@
+name: Create and show RDP password (unmasked)
+on:
+  workflow_dispatch:
+
+jobs:
+  unmasked-rdp:
+    runs-on: windows-latest
+
+    steps:
+      - name: Generate, set and print RDP password (UNMASKED)
+        shell: powershell
+        run: |
+          # Générer un mot de passe fort en clair (non masqué)
+          $pwLength = 20
+          $chars = (48..57) + (65..90) + (97..122) + (33..47)
+          $password = -join (Get-Random -Count $pwLength -InputObject $chars | ForEach-Object {[char]$_})
+          $username = 'rdp-guest'
+
+          # Créer ou réinitialiser l'utilisateur local
+          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
+            # Réinitialiser le mot de passe si l'utilisateur existe
+            $secure = ConvertTo-SecureString $password -AsPlainText -Force
+            Set-LocalUser -Name $username -Password $secure
+          } else {
+            $secure = ConvertTo-SecureString $password -AsPlainText -Force
+            New-LocalUser -Name $username -Password $secure -PasswordNeverExpires -AccountNeverExpires
+          }
+
+          # Ajouter au groupe Remote Desktop Users (pas admin)
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+
+          # Exporter en variable d'environnement pour les étapes suivantes (ATTENTION: visible si affichée)
+          "RDP_USER=$username" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          # Afficher le mot de passe en clair dans les logs (UNMASKED)
+          Write-Host "=== RDP CREDENTIALS (UNMASKED) ==="
+          Write-Host "User: $username"
+          Write-Host "Password: $password"
+          Write-Host "==================================="
+
+          # Sauvegarder dans un fichier temporaire pour upload (en clair)
+          $out = Join-Path $env:TEMP 'rdp-creds.txt'
+          "User: $username`nPassword: $password" | Out-File -FilePath $out -Encoding utf8
+
+          Write-Host "Les identifiants ont été générés et sont affichés en clair. Un artifact a été créé pour téléchargement."
+
+      - name: Upload credentials artifact (UNMASKED)
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-creds-unmasked
+          path: ${{ runner.temp }}\rdp-creds.txt
+
+      - name: Reminder / cleanup hint
+        if: always()
+        shell: powershell
+        run: |
+          Write-Host "Rappel : ces identifiants sont exposés en clair. Supprimez l'utilisateur ou changez le mot de passe après usage :"
+          Write-Host "To delete user: Remove-LocalUser -Name 'rdp-guest'"

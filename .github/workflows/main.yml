@@ -82,11 +82,11 @@ jobs:
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          # Locate tailscale.exe in common install locations
+          # Locate tailscale.exe in common install locations (use ${env:...} where name includes parentheses)
           $candidates = @(
-            (Join-Path $env:ProgramFiles 'Tailscale IPN\tailscale.exe'),
-            (Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'),
-            (Join-Path $env:ProgramFiles(x86) 'Tailscale\tailscale.exe')
+            (Join-Path ${env:ProgramFiles} 'Tailscale IPN\tailscale.exe'),
+            (Join-Path ${env:ProgramFiles} 'Tailscale\tailscale.exe'),
+            (Join-Path ${env:ProgramFiles(x86)} 'Tailscale\tailscale.exe')
           )
           $tsExe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $tsExe) { Write-Error "tailscale.exe introuvable. Installation a peut-être échoué."; exit 1 }
@@ -197,9 +197,9 @@ jobs:
 
             # Stop tailscale (best-effort)
             $candidates = @(
-              (Join-Path $env:ProgramFiles 'Tailscale IPN\tailscale.exe'),
-              (Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'),
-              (Join-Path $env:ProgramFiles(x86) 'Tailscale\tailscale.exe')
+              (Join-Path ${env:ProgramFiles} 'Tailscale IPN\tailscale.exe'),
+              (Join-Path ${env:ProgramFiles} 'Tailscale\tailscale.exe'),
+              (Join-Path ${env:ProgramFiles(x86)} 'Tailscale\tailscale.exe')
             )
             $tsExe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
             if ($tsExe) {
@@ -208,126 +208,4 @@ jobs:
             }
           } catch {
             Write-Warning "Cleanup encountered an issue: $_"
-          }        run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
-          $installerPath = Join-Path $env:TEMP 'tailscale.msi'
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
-
-      - name: Start Tailscale and create firewall rule limited to Tailscale interface
-        shell: powershell
-        env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-        run: |
-          $tsExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
-          if (-not (Test-Path $tsExe)) { Write-Error "tailscale.exe introuvable: $tsExe"; exit 1 }
-
-          if (-not $env:TAILSCALE_AUTH_KEY -or $env:TAILSCALE_AUTH_KEY -eq "") {
-            Write-Error "La clé TAILSCALE_AUTH_KEY n'est pas fournie dans les secrets."
-            exit 1
           }
-
-          # Start tailscale with the provided auth key. Avoid accepting routes automatically unless you want to.
-          & $tsExe up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID --accept-dns=false
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "tailscale up returned non-zero exit code: $LASTEXITCODE"
-          }
-
-          # Wait for IPv4 address
-          $tsIP = $null; $retries = 0
-          while (-not $tsIP -and $retries -lt 12) {
-            $tsIP = (& $tsExe ip -4).Trim()
-            if ($tsIP) { break }
-            Start-Sleep -Seconds 5
-            $retries++
-          }
-
-          if (-not $tsIP) { Write-Error "Tailscale n'a pas assigné d'IP après attente."; exit 1 }
-
-          # Export Tailscale IP to GITHUB_ENV for later steps
-          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-          # Clean previous rule if exists
-          if (Get-NetFirewallRule -DisplayName 'RDP-Tailscale' -ErrorAction SilentlyContinue) {
-            Remove-NetFirewallRule -DisplayName 'RDP-Tailscale' -ErrorAction SilentlyContinue
-          }
-
-          # Prefer to tie the firewall rule to the Tailscale interface
-          $adapter = Get-NetAdapter | Where-Object { $_.Name -like '*Tailscale*' } | Select-Object -First 1
-          if ($null -ne $adapter) {
-            New-NetFirewallRule -DisplayName 'RDP-Tailscale' -Direction Inbound -Action Allow `
-              -Protocol TCP -LocalPort 3389 -InterfaceAlias $adapter.Name -Profile Private,Domain
-            Write-Host "RDP rule created restricted to interface: $($adapter.Name)"
-          } else {
-            # Fallback: restrict to private/domain profiles only (not Public)
-            New-NetFirewallRule -DisplayName 'RDP-Tailscale' -Direction Inbound -Action Allow `
-              -Protocol TCP -LocalPort 3389 -Profile Private,Domain
-            Write-Warning "Aucun adaptateur Tailscale détecté: la règle firewall est limitée aux profils Private/Domain."
-          }
-
-      - name: Create non-admin RDP user with masked password
-        shell: powershell
-        run: |
-          # Generate a strong random password (complexity enforced)
-          Add-Type -AssemblyName System.Web
-          $pwLength = 20
-          $password = -join ((48..57) + (65..90) + (97..122) + (33..47) | Get-Random -Count $pwLength | ForEach-Object {[char]$_})
-
-          $username = "rdp-guest"
-
-          # If user exists, remove and recreate to ensure password is known only here
-          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
-            Remove-LocalUser -Name $username -ErrorAction SilentlyContinue
-          }
-
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name $username -Password $securePass -PasswordNeverExpires -AccountNeverExpires
-
-          # Grant only Remote Desktop Users (least privilege)
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
-
-          # Mask the password in GitHub logs and export minimal info to env
-          Write-Host "::add-mask::$password"
-          "RDP_USER=$username" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          # Do NOT write the password to GITHUB_ENV (cannot be secret afterwards). User sees it masked in logs only.
-
-          # Output a short confirmation
-          Write-Host "Utilisateur RDP créé : $username (mot de passe masqué)."
-
-      - name: Verify RDP accessibility over Tailscale
-        shell: powershell
-        run: |
-          $ip = $env:TAILSCALE_IP
-          if (-not $ip) { Write-Error "TAILSCALE_IP manquant."; exit 1 }
-
-          Write-Host "Testing connectivity to $ip:3389"
-          $test = Test-NetConnection -ComputerName $ip -Port 3389 -WarningAction SilentlyContinue
-          if (-not $test.TcpTestSucceeded) {
-            Write-Error "Connexion TCP vers $ip:3389 échouée."
-            exit 1
-          }
-          Write-Host "RDP TCP reachable over Tailscale."
-
-      - name: Announce connection info (password is masked)
-        shell: powershell
-        run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address (Tailscale): $env:TAILSCALE_IP"
-          Write-Host "Username: $env:RDP_USER"
-          Write-Host "Password: (masked in logs)"
-          Write-Host "==================`n"
-
-      - name: Keep runner available for a limited time (safe timeout)
-        shell: powershell
-        run: |
-          $minutes = [int]$env:RUN_DURATION_MINUTES
-          Write-Host "Runner will remain available for $minutes minutes. After that, the job ends and access is revoked."
-          Start-Sleep -Seconds ($minutes * 60)
-          Write-Host "Time expired. Job will finish; please revoke the Tailscale auth key / delete the user if needed."
-
-      - name: Optional cleanup hint (non-destructive)
-        shell: powershell
-        if: always()
-        run: |
-          Write-Host "Reminder: revoke or rotate the Tailscale auth key in the admin console and delete the local user $env:RDP_USER when done."

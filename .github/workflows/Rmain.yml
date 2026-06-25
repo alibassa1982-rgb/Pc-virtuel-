@@ -1,59 +1,193 @@
-name: Create and show RDP password (unmasked)
+name: Create RDP on GitHub runner with Tailscale (UNMASKED)
 on:
   workflow_dispatch:
 
 jobs:
-  unmasked-rdp:
+  create-rdp:
+    name: Create RDP on GitHub Windows runner
     runs-on: windows-latest
+    env:
+      # Minutes to keep the runner available (modifiable when dispatching)
+      RUN_DURATION_MINUTES: 60
 
     steps:
-      - name: Generate, set and print RDP password (UNMASKED)
+      - name: Generate RDP username & password (UNMASKED)
+        id: gencreds
         shell: powershell
         run: |
-          # Générer un mot de passe fort en clair (non masqué)
+          $username = "rdp-guest"
           $pwLength = 20
           $chars = (48..57) + (65..90) + (97..122) + (33..47)
           $password = -join (Get-Random -Count $pwLength -InputObject $chars | ForEach-Object {[char]$_})
-          $username = 'rdp-guest'
 
-          # Créer ou réinitialiser l'utilisateur local
-          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
-            # Réinitialiser le mot de passe si l'utilisateur existe
-            $secure = ConvertTo-SecureString $password -AsPlainText -Force
-            Set-LocalUser -Name $username -Password $secure
-          } else {
-            $secure = ConvertTo-SecureString $password -AsPlainText -Force
-            New-LocalUser -Name $username -Password $secure -PasswordNeverExpires -AccountNeverExpires
-          }
-
-          # Ajouter au groupe Remote Desktop Users (pas admin)
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
-
-          # Exporter en variable d'environnement pour les étapes suivantes (ATTENTION: visible si affichée)
+          # Export to GITHUB_ENV for later steps
           "RDP_USER=$username" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-          # Afficher le mot de passe en clair dans les logs (UNMASKED)
-          Write-Host "=== RDP CREDENTIALS (UNMASKED) ==="
-          Write-Host "User: $username"
-          Write-Host "Password: $password"
-          Write-Host "==================================="
+          Write-Host "Generated credentials for user: $username"
+          Write-Host "Password will be displayed later (UNMASKED)."
 
-          # Sauvegarder dans un fichier temporaire pour upload (en clair)
+      - name: Enable Remote Desktop (require NLA) and restart service
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 1 -Force
+          Restart-Service -Name TermService -Force
+
+      - name: Create or reset local RDP user (UNMASKED)
+        shell: powershell
+        env:
+          RDP_USER: ${{ env.RDP_USER }}
+          RDP_PASSWORD: ${{ env.RDP_PASSWORD }}
+        run: |
+          $username = $env:RDP_USER
+          $password = $env:RDP_PASSWORD
+          $secure = ConvertTo-SecureString $password -AsPlainText -Force
+
+          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name $username -Password $secure
+            Write-Host "Existing user $username: password reset."
+          } else {
+            New-LocalUser -Name $username -Password $secure -PasswordNeverExpires -AccountNeverExpires
+            Write-Host "Created user $username."
+          }
+
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+
+      - name: Install Tailscale (MSI)
+        shell: powershell
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installerPath = Join-Path $env:TEMP 'tailscale.msi'
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Start Tailscale and create firewall rule limited to Tailscale interface (if detected)
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          # Find tailscale executable (try common install paths)
+          $candidates = @(
+            (Join-Path $env:ProgramFiles 'Tailscale IPN\tailscale.exe'),
+            (Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'),
+            (Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe')
+          )
+          $tsExe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $tsExe) { Write-Error "tailscale.exe introuvable. Installation a peut-être échoué."; exit 1 }
+
+          if (-not $env:TAILSCALE_AUTH_KEY -or $env:TAILSCALE_AUTH_KEY -eq "") {
+            Write-Error "Le secret TAILSCALE_AUTH_KEY n'est pas fourni. Ajoutez-le aux secrets du repo."
+            exit 1
+          }
+
+          & $tsExe up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID --accept-dns=false --accept-routes=false
+          Start-Sleep -Seconds 3
+
+          # Wait for IPv4 address
+          $tsIP = $null
+          for ($i=0; $i -lt 14; $i++) {
+            $tsIP = (& $tsExe ip -4) -join ' ' 
+            $tsIP = ($tsIP -split "\s+")[0]
+            if ($tsIP) { break }
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not $tsIP) { Write-Error "Tailscale n'a pas assigné d'IP après attente."; exit 1 }
+
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Tailscale IP: $tsIP"
+
+          # Firewall rule: restrict to Tailscale interface if possible
+          $adapter = Get-NetAdapter | Where-Object { $_.InterfaceDescription -like '*Tailscale*' -or $_.Name -like '*Tailscale*' } | Select-Object -First 1
+          if ($null -ne $adapter) {
+            if (Get-NetFirewallRule -DisplayName 'RDP-Tailscale' -ErrorAction SilentlyContinue) {
+              Remove-NetFirewallRule -DisplayName 'RDP-Tailscale' -ErrorAction SilentlyContinue
+            }
+            New-NetFirewallRule -DisplayName 'RDP-Tailscale' -Direction Inbound -Action Allow `
+              -Protocol TCP -LocalPort 3389 -InterfaceAlias $adapter.Name -Profile Private,Domain
+            Write-Host "RDP firewall rule created on interface $($adapter.Name)."
+          } else {
+            if (Get-NetFirewallRule -DisplayName 'RDP-Tailscale' -ErrorAction SilentlyContinue) {
+              Remove-NetFirewallRule -DisplayName 'RDP-Tailscale' -ErrorAction SilentlyContinue
+            }
+            New-NetFirewallRule -DisplayName 'RDP-Tailscale' -Direction Inbound -Action Allow `
+              -Protocol TCP -LocalPort 3389 -Profile Private,Domain
+            Write-Warning "Aucun adaptateur Tailscale détecté: règle créée limitée aux profils Private/Domain."
+          }
+
+      - name: Save and show credentials (UNMASKED) and create artifact
+        shell: powershell
+        env:
+          RDP_USER: ${{ env.RDP_USER }}
+          RDP_PASSWORD: ${{ env.RDP_PASSWORD }}
+          TAILSCALE_IP: ${{ env.TAILSCALE_IP }}
+        run: |
+          $user = $env:RDP_USER
+          $pass = $env:RDP_PASSWORD
+          $ip = $env:TAILSCALE_IP
+
           $out = Join-Path $env:TEMP 'rdp-creds.txt'
-          "User: $username`nPassword: $password" | Out-File -FilePath $out -Encoding utf8
+          "User: $user`nPassword: $pass`nTailscale IP: $ip" | Out-File -FilePath $out -Encoding utf8
 
-          Write-Host "Les identifiants ont été générés et sont affichés en clair. Un artifact a été créé pour téléchargement."
+          Write-Host "=== RDP CREDENTIALS (UNMASKED) ==="
+          Write-Host "User: $user"
+          Write-Host "Password: $pass"
+          Write-Host "Tailscale IP: $ip"
+          Write-Host "==================================="
+          Write-Host "Saved credentials to $out"
 
       - name: Upload credentials artifact (UNMASKED)
         uses: actions/upload-artifact@v4
         with:
           name: rdp-creds-unmasked
-          path: ${{ runner.temp }}\rdp-creds.txt
+          path: ${{ env.TEMP }}\rdp-creds.txt
 
-      - name: Reminder / cleanup hint
+      - name: Keep runner available for a limited time (configurable)
+        shell: powershell
+        run: |
+          $minutes = [int]$env:RUN_DURATION_MINUTES
+          Write-Host "Runner will remain available for $minutes minute(s)."
+          # Loop printing heartbeat so logs show activity
+          $end = (Get-Date).AddMinutes($minutes)
+          while ((Get-Date) -lt $end) {
+            Write-Host ("[{0}] RDP ready at {1} (User: {2})" -f (Get-Date), $env:TAILSCALE_IP, $env:RDP_USER)
+            Start-Sleep -Seconds 30
+          }
+          Write-Host "RUN_DURATION elapsed; workflow will proceed to cleanup (if any) and finish."
+
+      - name: Optional cleanup (remove local user, stop tailscale) - runs always
         if: always()
         shell: powershell
         run: |
-          Write-Host "Rappel : ces identifiants sont exposés en clair. Supprimez l'utilisateur ou changez le mot de passe après usage :"
-          Write-Host "To delete user: Remove-LocalUser -Name 'rdp-guest'"
+          try {
+            # Remove user
+            if (Get-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue) {
+              Remove-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue
+              Write-Host "Local user $env:RDP_USER removed."
+            }
+
+            # Remove firewall rule
+            if (Get-NetFirewallRule -DisplayName 'RDP-Tailscale' -ErrorAction SilentlyContinue) {
+              Remove-NetFirewallRule -DisplayName 'RDP-Tailscale' -ErrorAction SilentlyContinue
+              Write-Host "Firewall rule RDP-Tailscale removed."
+            }
+
+            # Stop tailscale (best-effort)
+            $candidates = @(
+              (Join-Path $env:ProgramFiles 'Tailscale IPN\tailscale.exe'),
+              (Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe')
+            )
+            $tsExe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+            if ($tsExe) {
+              & $tsExe down
+              Write-Host "Tailscale stopped (down)."
+            }
+          } catch {
+            Write-Warning "Cleanup encountered an issue: $_"
+          }

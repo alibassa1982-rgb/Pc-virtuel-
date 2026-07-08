@@ -68,6 +68,10 @@ jobs:
 
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
 
+          # Grant local administrators rights (added)
+          Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+          Write-Host "User ${username} added to Administrators group."
+
       - name: Install Tailscale (MSI)
         shell: powershell
         run: |
@@ -186,6 +190,9 @@ jobs:
           try {
             $username = $env:RDP_USER
             if ($username -and (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
+              # Remove admin membership first (best-effort)
+              Remove-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+              Remove-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
               Remove-LocalUser -Name $username -ErrorAction SilentlyContinue
               Write-Host "Local user ${username} removed."
             }
